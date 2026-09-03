@@ -1,0 +1,21 @@
+{
+  // Type-checking / jest / ts-node config. `@aiking/shared` resolves to the
+  // package *source* here so `npm test` and `npm run dev` work without building
+  // the shared package first, and so an error in shared surfaces in context.
+  // That puts files above this directory in the program, which is why there is
+  // no `rootDir` — nothing is emitted from this config. `tsconfig.build.json`
+  // sets `rootDir`, re-enables emit, and points at the built declarations.
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "outDir": "dist",
+    "baseUrl": ".",
+    "types": ["node", "jest"],
+    "paths": {
+      "@aiking/shared": ["../../packages/shared/src/index.ts"],
+      "@/*": ["src/*"]
+    }
+  },
+  "include": ["src/**/*.ts", "test/**/*.ts", "prisma/**/*.ts"],
+  "exclude": ["node_modules", "dist"]
+}

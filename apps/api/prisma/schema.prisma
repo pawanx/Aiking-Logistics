@@ -1,0 +1,910 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// Aiking Solutions — database schema
+//
+// Implements spec §9.3 "Core Schema" in full. Design constraints from §9.1/§9.2:
+//
+//   • Money is ALWAYS BigInt paise. There is no Decimal or Float column for a
+//     monetary value anywhere in this file (§9.1).
+//   • Every tenant-scoped table carries tenant_id and indexes it first (§9.2),
+//     so a shared-schema multi-tenant query is always index-covered and the
+//     optional RLS policies in migrations/rls.sql have a column to key on.
+//   • Idempotency is enforced by UNIQUE constraints on the provider's own
+//     reference id, not by application-level checks (§8.1, §8.2, §15).
+//   • Ledger tables (wallet_transactions, usage_events, communication_events)
+//     are append-only by convention — nothing in the codebase updates or
+//     deletes them (§10 "Immutable ledger; never edited in place").
+// ═══════════════════════════════════════════════════════════════════════════════
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// Prisma 7 no longer accepts `url` here — the connection string lives in
+// prisma.config.ts for CLI/migrate, and is passed to PrismaClient via the
+// node-postgres driver adapter at runtime (see src/common/prisma/prisma.service.ts).
+datasource db {
+  provider = "postgresql"
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Enums — mirrored in packages/shared/src/enums.ts for the frontend
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum TenantStatus {
+  active
+  suspended
+  pending
+}
+
+enum Role {
+  super_admin
+  manager
+  staff
+}
+
+enum InviteStatus {
+  invited
+  active
+  revoked
+}
+
+enum Channel {
+  whatsapp
+  email
+  call
+}
+
+enum UsageEventType {
+  whatsapp_message
+  email_message
+  ai_call_minute
+}
+
+/// Balance movements only. A reserve-then-confirm hold moves *availability*, not
+/// balance, so it lives in `wallet_reservations` — which keeps
+/// `sum(amount_paise) = balance_paise + free_credit_balance_paise` exactly true.
+enum WalletTransactionType {
+  topup_credit
+  free_credit_grant
+  usage_debit
+  free_credit_debit
+  adjustment
+  refund
+}
+
+enum BalanceBucket {
+  paid
+  free
+}
+
+enum LowBalanceBehavior {
+  hard_stop
+  soft_limit
+}
+
+enum ReservationStatus {
+  held
+  confirmed
+  released
+}
+
+enum RazorpayOrderStatus {
+  created
+  attempted
+  paid
+  failed
+}
+
+enum RazorpayPaymentStatus {
+  captured
+  authorized
+  failed
+  refunded
+}
+
+enum CampaignStatus {
+  draft
+  scheduled
+  queued
+  sending
+  completed
+  completed_with_failures
+  halted_insufficient_funds
+  cancelled
+  failed
+}
+
+enum RecipientStatus {
+  pending
+  queued
+  sent
+  delivered
+  read
+  opened
+  clicked
+  failed
+  bounced
+  skipped_opted_out
+  skipped_insufficient_funds
+}
+
+enum TemplateStatus {
+  draft
+  pending_approval
+  approved
+  rejected
+  paused
+}
+
+enum CallDirection {
+  outbound
+  inbound
+}
+
+enum CallStatus {
+  queued
+  initiated
+  ringing
+  in_progress
+  summarizing
+  completed
+  no_answer
+  busy
+  failed
+  escalated
+}
+
+enum CallOutcome {
+  resolved
+  follow_up_required
+  escalated_to_human
+  not_interested
+  unreachable
+  unknown
+}
+
+enum TranscriptSpeaker {
+  agent
+  customer
+  system
+}
+
+enum CommunicationEventType {
+  whatsapp_sent
+  whatsapp_delivered
+  whatsapp_read
+  whatsapp_failed
+  whatsapp_inbound
+  email_sent
+  email_delivered
+  email_opened
+  email_clicked
+  email_bounced
+  call_placed
+  call_completed
+  call_failed
+  call_escalated
+  contact_opted_out
+  contact_opted_in
+}
+
+enum EventDirection {
+  outbound
+  inbound
+  system
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// tenants — tenant company registration, status, plan (§9.3)
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Tenant {
+  id           String       @id @default(uuid()) @db.Uuid
+  name         String
+  slug         String       @unique
+  status       TenantStatus @default(active)
+  plan         String       @default("standard")
+  contactEmail String?      @map("contact_email")
+
+  // Spec §4.4 open item — whether Staff may launch campaigns / trigger calls is
+  // undecided in the document, so it is configuration rather than a code fork.
+  // Both default to false: granting spend rights by default would let Staff draw
+  // down the wallet before anyone has decided they may.
+  staffCanLaunchCampaigns Boolean @default(false) @map("staff_can_launch_campaigns")
+  staffCanTriggerCalls    Boolean @default(false) @map("staff_can_trigger_calls")
+
+  // Spec §5.3 open item — a call that would overdraw the wallet either stops
+  // hard or runs against a configurable soft limit.
+  lowBalanceBehavior       LowBalanceBehavior @default(hard_stop) @map("low_balance_behavior")
+  softLimitPaise           BigInt             @default(0) @map("soft_limit_paise")
+  lowBalanceThresholdPaise BigInt             @default(10000) @map("low_balance_threshold_paise")
+
+  // Per-tenant sending identity (spec §6.2 — "the tenant's own sending identity").
+  emailFromName    String? @map("email_from_name")
+  emailFromAddress String? @map("email_from_address")
+  whatsappPhoneNumberId String? @map("whatsapp_phone_number_id")
+
+  suspendedAt     DateTime? @map("suspended_at")
+  suspendedReason String?   @map("suspended_reason")
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+
+  tenantUsers         TenantUser[]
+  contacts            Contact[]
+  wallet              Wallet?
+  walletTransactions  WalletTransaction[]
+  reservations        WalletReservation[]
+  razorpayOrders      RazorpayOrder[]
+  razorpayPayments    RazorpayPayment[]
+  pricingRules        PricingRule[]
+  usageEvents         UsageEvent[]
+  campaigns           Campaign[]
+  campaignRecipients  CampaignRecipient[]
+  calls               Call[]
+  communicationEvents CommunicationEvent[]
+  templates           Template[]
+
+  @@index([status])
+  @@map("tenants")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// users — global user accounts, includes the Super Admin flag (§9.3)
+// ─────────────────────────────────────────────────────────────────────────────
+
+model User {
+  id           String  @id @default(uuid()) @db.Uuid
+  email        String  @unique
+  passwordHash String  @map("password_hash")
+  fullName     String  @map("full_name")
+
+  // Spec §4.3 — the JWT carries is_super_admin; a Super Admin has no tenant
+  // scope of its own and reaches tenant data only through support access.
+  isSuperAdmin Boolean @default(false) @map("is_super_admin")
+
+  isActive    Boolean   @default(true) @map("is_active")
+  lastLoginAt DateTime? @map("last_login_at")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+
+  tenantUsers TenantUser[]
+
+  @@index([isSuperAdmin])
+  @@map("users")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// tenant_users — per-tenant role assignment, invite status (§9.3)
+// ─────────────────────────────────────────────────────────────────────────────
+
+model TenantUser {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @map("tenant_id") @db.Uuid
+  userId   String @map("user_id") @db.Uuid
+
+  // Only manager | staff are meaningful here; super_admin is a User flag.
+  role         Role         @default(staff)
+  inviteStatus InviteStatus @default(invited) @map("invite_status")
+  invitedBy    String?      @map("invited_by") @db.Uuid
+  invitedAt    DateTime     @default(now()) @map("invited_at")
+  acceptedAt   DateTime?    @map("accepted_at")
+  revokedAt    DateTime?    @map("revoked_at")
+  createdAt    DateTime     @default(now()) @map("created_at")
+  updatedAt    DateTime     @updatedAt @map("updated_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // One membership per user per tenant. A user may belong to several tenants.
+  @@unique([tenantId, userId])
+  @@index([tenantId, role])
+  @@index([userId])
+  @@map("tenant_users")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// contacts — the tenant's CRM records (§7, §9.3)
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Contact {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @map("tenant_id") @db.Uuid
+
+  fullName String  @map("full_name")
+  phone    String?
+  email    String?
+
+  // Spec §7 — flexible per-tenant fields (a logistics tenant's shipment
+  // reference or delivery zone) with no per-tenant schema change.
+  customFields Json     @default("{}") @map("custom_fields")
+  tags         String[] @default([])
+
+  // Spec §12 — WhatsApp opt-in captured per contact; opt-out honored immediately.
+  whatsappOptedIn Boolean   @default(false) @map("whatsapp_opted_in")
+  emailOptedIn    Boolean   @default(true) @map("email_opted_in")
+  optedOutAt      DateTime? @map("opted_out_at")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  tenant              Tenant               @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  campaignRecipients  CampaignRecipient[]
+  calls               Call[]
+  communicationEvents CommunicationEvent[]
+  usageEvents         UsageEvent[]
+
+  // Phone and email are unique per tenant, not globally: two tenants may
+  // legitimately hold the same customer.
+  @@unique([tenantId, phone])
+  @@unique([tenantId, email])
+  @@index([tenantId, createdAt])
+  @@index([tenantId, fullName])
+  @@map("contacts")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// wallets — one row per tenant: balance, free-credit balance (§9.3)
+//
+// This is the row every balance mutation takes a SELECT … FOR UPDATE lock on
+// (§9.1 "row-level locking prevents race conditions").
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Wallet {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @unique @map("tenant_id") @db.Uuid
+
+  /// Paid balance from Razorpay top-ups, in paise.
+  balancePaise BigInt @default(0) @map("balance_paise")
+
+  /// Free credits granted at onboarding, tracked separately so free-funded and
+  /// paid-funded usage stay separately reportable (§8.3).
+  freeCreditBalancePaise BigInt @default(0) @map("free_credit_balance_paise")
+
+  /// Held by in-flight reservations — funds committed to a provider call that
+  /// has not yet confirmed (§15 reserve-then-confirm).
+  reservedPaise BigInt @default(0) @map("reserved_paise")
+
+  /// Running totals, maintained inside the same locked transaction. Denormalised
+  /// deliberately: a Manager's ledger view would otherwise aggregate the whole
+  /// append-only history on every page load.
+  lifetimeCreditedPaise BigInt @default(0) @map("lifetime_credited_paise")
+  lifetimeDebitedPaise  BigInt @default(0) @map("lifetime_debited_paise")
+
+  currency  String   @default("INR")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@map("wallets")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// wallet_transactions — immutable append-only ledger of every credit and debit
+// (§9.3, §10 "never edited in place, only appended")
+// ─────────────────────────────────────────────────────────────────────────────
+
+model WalletTransaction {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @map("tenant_id") @db.Uuid
+
+  type   WalletTransactionType
+  bucket BalanceBucket         @default(paid)
+
+  /// Signed: positive credits, negative debits. Paise.
+  amountPaise BigInt @map("amount_paise")
+
+  /// Spendable balance (paid + free) immediately after this row was written.
+  /// Captured inside the locked transaction, so the ledger is self-auditing.
+  balanceAfterPaise BigInt @map("balance_after_paise")
+
+  description String
+
+  /// What caused this movement — 'razorpay_payment' | 'usage_event' |
+  /// 'reservation' | 'onboarding' | 'manual'.
+  referenceType String? @map("reference_type")
+  referenceId   String? @map("reference_id")
+
+  /// Spec §15 — idempotency key on every balance mutation. UNIQUE per tenant, so
+  /// a redelivered webhook or retried job cannot double-apply. Nullable because
+  /// a Super Admin's manual adjustment has no external reference.
+  idempotencyKey String? @map("idempotency_key")
+
+  createdBy String?  @map("created_by") @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, idempotencyKey], name: "wallet_tx_tenant_idempotency")
+  @@index([tenantId, createdAt(sort: Desc)])
+  @@index([tenantId, type])
+  @@map("wallet_transactions")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// wallet_reservations — the reserve-then-confirm hold (§15)
+//
+// Not named in §9.3's table list, but §15 names reserve-then-confirm as the
+// mitigation for "billing a tenant for a message/call that then fails at the
+// provider". A hold needs somewhere to live.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model WalletReservation {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @map("tenant_id") @db.Uuid
+
+  amountPaise BigInt            @map("amount_paise")
+  status      ReservationStatus @default(held)
+
+  /// What the hold is for — 'campaign_recipient' | 'call'.
+  referenceType String? @map("reference_type")
+  referenceId   String? @map("reference_id")
+
+  /// Same idempotency discipline as the ledger: a retried job re-reserving the
+  /// same unit of work finds the existing hold instead of taking a second one.
+  idempotencyKey String @map("idempotency_key")
+
+  /// Set on confirm — the amount actually charged, which may differ from the
+  /// held amount (a call's real duration versus its estimate).
+  settledAmountPaise BigInt?   @map("settled_amount_paise")
+  confirmedAt        DateTime? @map("confirmed_at")
+  releasedAt         DateTime? @map("released_at")
+  releaseReason      String?   @map("release_reason")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, idempotencyKey], name: "reservation_tenant_idempotency")
+  @@index([tenantId, status])
+  @@map("wallet_reservations")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// razorpay_orders / razorpay_payments — order/payment records, idempotency key,
+// signature verification status (§8.1, §9.3)
+// ─────────────────────────────────────────────────────────────────────────────
+
+model RazorpayOrder {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @map("tenant_id") @db.Uuid
+
+  /// Razorpay's own order id (order_...). Unique — one local row per remote order.
+  razorpayOrderId String @unique @map("razorpay_order_id")
+
+  amountPaise BigInt              @map("amount_paise")
+  currency    String              @default("INR")
+  status      RazorpayOrderStatus @default(created)
+  receipt     String?
+  notes       Json                @default("{}")
+
+  createdBy String   @map("created_by") @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  tenant   Tenant            @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  payments RazorpayPayment[]
+
+  @@index([tenantId, createdAt(sort: Desc)])
+  @@map("razorpay_orders")
+}
+
+model RazorpayPayment {
+  id       String  @id @default(uuid()) @db.Uuid
+  tenantId String  @map("tenant_id") @db.Uuid
+  orderId  String? @map("order_id") @db.Uuid
+
+  /// Spec §8.1 — "idempotent on payment_id, since webhooks can be redelivered".
+  /// This UNIQUE constraint is the whole mechanism: a duplicate
+  /// payment.captured hits it and the handler returns the existing row rather
+  /// than crediting the wallet twice (§15).
+  razorpayPaymentId String @unique @map("razorpay_payment_id")
+  razorpayOrderId   String @map("razorpay_order_id")
+
+  amountPaise BigInt                @map("amount_paise")
+  currency    String                @default("INR")
+  status      RazorpayPaymentStatus
+  method      String?
+
+  /// Spec §12 — every webhook is signature-verified before it is trusted.
+  /// Recorded so a payment credited on an unverified signature is impossible to
+  /// hide after the fact.
+  signatureVerified Boolean @default(false) @map("signature_verified")
+
+  /// Set once the wallet credit has actually been applied. Distinguishes "we
+  /// know about this payment" from "we have credited it".
+  creditedAt          DateTime? @map("credited_at")
+  walletTransactionId String?   @map("wallet_transaction_id") @db.Uuid
+
+  /// Raw provider payload, kept verbatim for dispute resolution.
+  rawPayload Json     @default("{}") @map("raw_payload")
+  createdAt  DateTime @default(now()) @map("created_at")
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  tenant Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  order  RazorpayOrder? @relation(fields: [orderId], references: [id], onDelete: SetNull)
+
+  @@index([tenantId, createdAt(sort: Desc)])
+  @@index([razorpayOrderId])
+  @@map("razorpay_payments")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// pricing_rules — per-event-type pricing, editable without redeploy (§9.3)
+// ─────────────────────────────────────────────────────────────────────────────
+
+model PricingRule {
+  id String @id @default(uuid()) @db.Uuid
+
+  /// NULL = the platform default, applied to any tenant without an override.
+  /// This is the one tenant-scoped table where NULL tenant_id is meaningful.
+  tenantId String? @map("tenant_id") @db.Uuid
+
+  eventType      UsageEventType @map("event_type")
+  unitPricePaise BigInt         @map("unit_price_paise")
+  currency       String         @default("INR")
+
+  effectiveFrom DateTime  @default(now()) @map("effective_from")
+  effectiveTo   DateTime? @map("effective_to")
+  active        Boolean   @default(true)
+
+  createdBy String?  @map("created_by") @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  tenant Tenant? @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, eventType, active])
+  @@index([eventType, active])
+  @@map("pricing_rules")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// usage_events — immutable log of every billable action; audit trail and
+// billing source (§8.2, §9.3)
+// ─────────────────────────────────────────────────────────────────────────────
+
+model UsageEvent {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @map("tenant_id") @db.Uuid
+
+  eventType UsageEventType @map("event_type")
+
+  /// Messages for WhatsApp/email; billable minutes for a call (§5.3).
+  quantity Int @default(1)
+
+  unitPricePaise   BigInt @map("unit_price_paise")
+  totalChargePaise BigInt @map("total_charge_paise")
+
+  /// Spec §8.2 — "idempotency enforced via a unique constraint on the provider's
+  /// own reference ID (e.g. the WhatsApp message ID or Plivo call UUID)".
+  idempotencyKey String @map("idempotency_key")
+
+  /// Which balance actually funded it, for §8.3 free-vs-paid reporting.
+  bucket BalanceBucket @default(paid)
+
+  contactId  String? @map("contact_id") @db.Uuid
+  campaignId String? @map("campaign_id") @db.Uuid
+  callId     String? @map("call_id") @db.Uuid
+
+  walletTransactionId String? @map("wallet_transaction_id") @db.Uuid
+
+  metadata   Json     @default("{}")
+  occurredAt DateTime @default(now()) @map("occurred_at")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  tenant   Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  contact  Contact?  @relation(fields: [contactId], references: [id], onDelete: SetNull)
+  campaign Campaign? @relation(fields: [campaignId], references: [id], onDelete: SetNull)
+  call     Call?     @relation(fields: [callId], references: [id], onDelete: SetNull)
+
+  @@unique([tenantId, idempotencyKey], name: "usage_tenant_idempotency")
+  @@index([tenantId, occurredAt(sort: Desc)])
+  @@index([tenantId, eventType, occurredAt])
+  @@map("usage_events")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// templates — WhatsApp/email template content and approval status (§6.1, §9.3)
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Template {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @map("tenant_id") @db.Uuid
+
+  name     String
+  channel  Channel
+  status   TemplateStatus @default(draft)
+  language String         @default("en")
+
+  /// Email only.
+  subject String?
+  body    String
+
+  /// Placeholders found in `body`, e.g. ["fullName","shipmentRef"].
+  variables String[] @default([])
+
+  /// Spec §6.1 — Meta's pre-approval workflow has multi-day external lead time,
+  /// so submission state is tracked explicitly and campaigns refuse to launch on
+  /// a WhatsApp template that is not `approved`.
+  providerTemplateName String?   @map("provider_template_name")
+  submittedAt          DateTime? @map("submitted_at")
+  approvedAt           DateTime? @map("approved_at")
+  rejectionReason      String?   @map("rejection_reason")
+
+  createdBy String?  @map("created_by") @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  tenant    Tenant     @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  campaigns Campaign[]
+
+  @@unique([tenantId, name, channel])
+  @@index([tenantId, channel, status])
+  @@map("templates")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// campaigns — channel, template, schedule (§9.3)
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Campaign {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @map("tenant_id") @db.Uuid
+
+  name       String
+  channel    Channel
+  status     CampaignStatus @default(draft)
+  templateId String?        @map("template_id") @db.Uuid
+
+  /// Per-campaign variable defaults, merged beneath each contact's own fields.
+  variables Json @default("{}")
+
+  scheduledAt DateTime? @map("scheduled_at")
+  startedAt   DateTime? @map("started_at")
+  completedAt DateTime? @map("completed_at")
+
+  /// Computed at launch from pricing_rules × recipient count, so the wallet
+  /// pre-check in §8.2 has something to compare against.
+  estimatedCostPaise BigInt @default(0) @map("estimated_cost_paise")
+  actualCostPaise    BigInt @default(0) @map("actual_cost_paise")
+
+  failureReason String? @map("failure_reason")
+
+  createdBy String   @map("created_by") @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  tenant              Tenant               @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  template            Template?            @relation(fields: [templateId], references: [id], onDelete: SetNull)
+  recipients          CampaignRecipient[]
+  usageEvents         UsageEvent[]
+  communicationEvents CommunicationEvent[]
+
+  @@index([tenantId, createdAt(sort: Desc)])
+  @@index([tenantId, status])
+  @@map("campaigns")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// campaign_recipients — per-recipient delivery/interaction status (§9.3)
+//
+// Spec §6.1: terminal failures are "surfaced per-recipient rather than failing
+// the whole campaign", so per-recipient error detail lives here.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model CampaignRecipient {
+  id         String @id @default(uuid()) @db.Uuid
+  tenantId   String @map("tenant_id") @db.Uuid
+  campaignId String @map("campaign_id") @db.Uuid
+  contactId  String @map("contact_id") @db.Uuid
+
+  /// Phone number or email address resolved at launch, so a later edit to the
+  /// contact does not rewrite history.
+  destination String
+  status      RecipientStatus @default(pending)
+
+  /// The provider's message id — WhatsApp wamid or SES message id. Doubles as
+  /// the metering idempotency key (§8.2) and the join key for delivery webhooks.
+  providerMessageId String? @map("provider_message_id")
+
+  errorCode    String? @map("error_code")
+  errorMessage String? @map("error_message")
+  attempts     Int     @default(0)
+
+  costPaise BigInt? @map("cost_paise")
+
+  queuedAt    DateTime? @map("queued_at")
+  sentAt      DateTime? @map("sent_at")
+  deliveredAt DateTime? @map("delivered_at")
+  readAt      DateTime? @map("read_at")
+  openedAt    DateTime? @map("opened_at")
+  clickedAt   DateTime? @map("clicked_at")
+  failedAt    DateTime? @map("failed_at")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  tenant   Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  contact  Contact  @relation(fields: [contactId], references: [id], onDelete: Cascade)
+
+  /// A contact appears at most once per campaign.
+  @@unique([campaignId, contactId])
+  /// Delivery webhooks arrive keyed only on the provider's message id.
+  @@index([providerMessageId])
+  @@index([tenantId, campaignId, status])
+  @@map("campaign_recipients")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// calls — AI call records: transcript, summary, next-action, recording
+// reference, duration (§5, §9.3)
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Call {
+  id        String @id @default(uuid()) @db.Uuid
+  tenantId  String @map("tenant_id") @db.Uuid
+  contactId String @map("contact_id") @db.Uuid
+
+  direction CallDirection @default(outbound)
+  status    CallStatus    @default(queued)
+  outcome   CallOutcome?
+
+  /// Spec §5.1 step 1 — the Plivo call UUID. Also the metering idempotency key
+  /// for per-minute billing (§8.2).
+  providerCallId String? @unique @map("provider_call_id")
+
+  fromNumber String @map("from_number")
+  toNumber   String @map("to_number")
+
+  durationSeconds Int     @default(0) @map("duration_seconds")
+  /// Rounded up from durationSeconds — the metered unit (§5.3).
+  billedMinutes   Int     @default(0) @map("billed_minutes")
+  costPaise       BigInt? @map("cost_paise")
+
+  /// Spec §5.1 step 4 — S3 object key, never a public URL. Access is logged
+  /// (§10 "Access should be logged").
+  recordingKey      String? @map("recording_key")
+  recordingDurationSeconds Int? @map("recording_duration_seconds")
+
+  /// Spec §5.1 step 5 — post-call extraction/summarization.
+  summary    String?
+  nextAction String? @map("next_action")
+
+  /// Spec §5.2 — "the agent's script/prompt is versioned and reviewed like code
+  /// before any change reaches live calls". Recorded per call so a bad response
+  /// can be traced to the exact prompt that produced it.
+  scriptId      String? @map("script_id")
+  promptVersion String? @map("prompt_version")
+  objective     String?
+
+  /// Spec §5.2 — escalation to a human.
+  escalatedAt     DateTime? @map("escalated_at")
+  escalationReason String?  @map("escalation_reason")
+
+  failureReason String? @map("failure_reason")
+  metadata      Json    @default("{}")
+
+  startedAt DateTime? @map("started_at")
+  endedAt   DateTime? @map("ended_at")
+  createdBy String?   @map("created_by") @db.Uuid
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+
+  tenant              Tenant               @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  contact             Contact              @relation(fields: [contactId], references: [id], onDelete: Cascade)
+  transcriptTurns     CallTranscriptTurn[]
+  usageEvents         UsageEvent[]
+  communicationEvents CommunicationEvent[]
+
+  @@index([tenantId, createdAt(sort: Desc)])
+  @@index([tenantId, status])
+  @@index([tenantId, contactId])
+  @@map("calls")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// call_transcript_turns — the turn-by-turn transcript from §5.1 steps 2–3
+//
+// Kept as rows rather than a JSON blob on `calls` so a transcript can be paged
+// and searched. §10 classifies raw transcripts as High sensitivity.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model CallTranscriptTurn {
+  id     String @id @default(uuid()) @db.Uuid
+  callId String @map("call_id") @db.Uuid
+
+  sequence Int
+  speaker  TranscriptSpeaker
+  text     String
+
+  /// Deepgram confidence 0–1, where the provider reports it.
+  confidence Float?
+  atSeconds  Float  @default(0) @map("at_seconds")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  call Call @relation(fields: [callId], references: [id], onDelete: Cascade)
+
+  @@unique([callId, sequence])
+  @@index([callId, sequence])
+  @@map("call_transcript_turns")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// communication_events — the unified log powering the 360° timeline (§6.4, §9.3)
+//
+// Spec §6.4: "keyed on contact_id and occurred_at… a single indexed query over
+// this table rather than three separate per-channel queries stitched together at
+// the UI layer". The composite index below is what makes that true.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model CommunicationEvent {
+  id        String @id @default(uuid()) @db.Uuid
+  tenantId  String @map("tenant_id") @db.Uuid
+  contactId String @map("contact_id") @db.Uuid
+
+  channel   Channel
+  eventType CommunicationEventType @map("event_type")
+  direction EventDirection         @default(outbound)
+
+  /// Human-readable one-liner rendered directly in the timeline.
+  summary String
+
+  campaignId String? @map("campaign_id") @db.Uuid
+  callId     String? @map("call_id") @db.Uuid
+
+  /// Provider message id / call uuid, so an event can be traced to its provider.
+  providerReference String? @map("provider_reference")
+
+  metadata   Json     @default("{}")
+  occurredAt DateTime @default(now()) @map("occurred_at")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  tenant   Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  contact  Contact   @relation(fields: [contactId], references: [id], onDelete: Cascade)
+  campaign Campaign? @relation(fields: [campaignId], references: [id], onDelete: SetNull)
+  call     Call?     @relation(fields: [callId], references: [id], onDelete: SetNull)
+
+  /// The 360° timeline query (§6.4) — one contact, newest first.
+  @@index([tenantId, contactId, occurredAt(sort: Desc)])
+  /// Tenant-wide activity feed and per-channel reporting (§11.1).
+  @@index([tenantId, occurredAt(sort: Desc)])
+  @@index([tenantId, channel, occurredAt(sort: Desc)])
+  @@map("communication_events")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// webhook_deliveries — inbound webhook audit log
+//
+// Not in §9.3's list, but §12 requires every inbound webhook be
+// signature-verified before processing, and §16 requires that idempotency be
+// demonstrably tested. Recording each delivery with its verification result and
+// whether it was a replay is what makes both auditable.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model WebhookDelivery {
+  id String @id @default(uuid()) @db.Uuid
+
+  /// 'razorpay' | 'meta' | 'plivo' | 'email'
+  provider String
+  eventType String? @map("event_type")
+
+  /// The provider's own event id where it supplies one — the replay key.
+  providerEventId String? @map("provider_event_id")
+
+  signatureVerified Boolean @default(false) @map("signature_verified")
+  /// True when this delivery matched an already-processed event and was skipped.
+  duplicate         Boolean @default(false)
+  processed         Boolean @default(false)
+  errorMessage      String? @map("error_message")
+
+  payload    Json     @default("{}")
+  receivedAt DateTime @default(now()) @map("received_at")
+
+  @@unique([provider, providerEventId])
+  @@index([provider, receivedAt(sort: Desc)])
+  @@map("webhook_deliveries")
+}

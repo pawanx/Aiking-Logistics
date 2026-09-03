@@ -1,0 +1,20 @@
+{
+  // Emit config used by `nest build`. Compiles only `src`, resolves
+  // `@aiking/shared` to the built declarations (so the shared package must be
+  // built first — the root `build` script orders it that way), and excludes
+  // tests and the seed script from the shipped output.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "rootDir": "src",
+    "outDir": "dist",
+    "declaration": false,
+    "declarationMap": false,
+    "paths": {
+      "@aiking/shared": ["../../packages/shared/dist/index.d.ts"],
+      "@/*": ["src/*"]
+    }
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "dist", "test", "**/*.spec.ts", "**/*.e2e-spec.ts", "prisma"]
+}

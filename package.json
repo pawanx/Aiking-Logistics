@@ -1,0 +1,41 @@
+{
+  "name": "aiking-logistics",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Aiking Solutions — Multi-Tenant AI Customer Communication Platform",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "engines": {
+    "node": ">=20.11"
+  },
+  "scripts": {
+    "build": "npm run build --workspace @aiking/shared && npm run build --workspace @aiking/api && npm run build --workspace @aiking/web",
+    "build:api": "npm run build --workspace @aiking/shared && npm run build --workspace @aiking/api",
+    "lint": "npm run lint --workspace @aiking/api && npm run lint --workspace @aiking/web",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test": "npm run test --workspace @aiking/api",
+    "test:e2e": "npm run test:e2e --workspace @aiking/api",
+    "test:all": "npm run test && npm run test:e2e",
+    "prisma:generate": "npm run prisma:generate --workspace @aiking/api",
+    "prisma:migrate": "npm run prisma:migrate --workspace @aiking/api",
+    "prisma:push": "npm run prisma:push --workspace @aiking/api",
+    "seed": "npm run seed --workspace @aiking/api",
+    "dev": "node scripts/dev.mjs",
+    "dev:api": "npm run dev --workspace @aiking/api",
+    "dev:worker": "npm run dev:worker --workspace @aiking/api",
+    "dev:web": "npm run dev --workspace @aiking/web",
+    "infra:up": "docker compose -f docker-compose.infra.yml up -d",
+    "infra:down": "docker compose -f docker-compose.infra.yml down",
+    "infra:logs": "docker compose -f docker-compose.infra.yml logs -f",
+    "docker:up": "docker compose up -d --build",
+    "docker:down": "docker compose down -v",
+    "docker:logs": "docker compose logs -f",
+    "smoke": "node scripts/smoke.mjs",
+    "verify": "node scripts/verify.mjs"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3"
+  }
+}

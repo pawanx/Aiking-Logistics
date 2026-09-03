@@ -1,0 +1,46 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Aiking Solutions — local infrastructure
+#
+# `npm run infra:up`  → start Postgres + Redis for local development
+# `npm run infra:down` → stop and remove containers (volumes persist)
+# `npm run infra:logs` → tail container logs
+#
+# This does NOT run the application itself — use `npm run dev` for that.
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: aiking-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: aiking
+      POSTGRES_PASSWORD: aiking
+      POSTGRES_DB: aiking
+    ports:
+      - "5432:5432"
+    volumes:
+      - aiking_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aiking"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: aiking-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - aiking_redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  aiking_pgdata:
+  aiking_redis:
