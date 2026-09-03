@@ -2,9 +2,7 @@
  * Typed API Client for Aiking Logistics Web Portal.
  * Automatically manages Authorization header from localStorage.
  */
-
-const API_BASE = '/api';
-
+const API_BASE = String((import.meta as any).env?.VITE_API_BASE_URL || '/api').replace(/\/+$/, '');
 export class ApiError extends Error {
   constructor(
     public status: number,
